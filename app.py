@@ -35,15 +35,57 @@ page = st.sidebar.radio(
 # Cache data loading voor performance
 @st.cache_data
 def load_data():
-    """Laad vastgoeddata (cached voor snelheid)"""
-    try:
-        df = pd.read_csv('data/vastgoed_data.csv')
-        df['datum'] = pd.to_datetime(df['datum'])
-    except:
-        st.info("Genereer sample data...")
-        df = create_sample_vastgoed_data(5000)
-        df.to_csv('data/vastgoed_data.csv', index=False)
-    return df
+    """Laad CBS vastgoeddata (cached voor snelheid)"""
+    collector = VastgoedDataCollector()
+    df = collector.get_historical_price_data(years_back=5)
+    
+    if df is None or df.empty:
+        st.error("Kon geen CBS data ophalen!")
+        return pd.DataFrame()
+    
+    # Transform CBS data naar verwacht format voor de app
+    df_transformed = df.copy()
+    
+    # Mapping van CBS regio codes naar leesbare namen
+    region_mapping = {
+        'NL01': 'Nederland',
+        'LD01': 'Limburg',
+        'NB01': 'Noord-Brabant', 
+        'ZH01': 'Zuid-Holland',
+        'NH01': 'Noord-Holland',
+        'UT01': 'Utrecht',
+        'GE01': 'Gelderland',
+        'OV01': 'Overijssel',
+        'FL01': 'Flevoland',
+        'DR01': 'Drenthe',
+        'GR01': 'Groningen',
+        'FR01': 'Friesland',
+        'ZE01': 'Zeeland'
+        # Voeg meer mappings toe als nodig
+    }
+
+    # Vervang bekende codes, voor onbekende: verwijder GM/BU/WK prefixes
+    def clean_region_name(code):
+        if code in basic_mapping:
+            return basic_mapping[code]
+        # Verwijder CBS prefixes en maak leesbaar
+        cleaned = code.replace('GM', 'Gemeente ').replace('BU', 'Buurt ').replace('WK', 'Wijk ')
+        return cleaned
+    
+    # Vervang regio codes door leesbare namen
+    df_transformed['stad'] = df_transformed['regio'].map(region_mapping).fillna(df_transformed['regio'])
+    df_transformed['prijs'] = df_transformed['gemiddelde_prijs']
+    
+    # Voeg ontbrekende kolommen toe
+    df_transformed['type_woning'] = 'Gemiddeld'
+    df_transformed['wijk'] = 'Centrum'
+    df_transformed['oppervlakte'] = 100
+    df_transformed['kamers'] = 3
+    df_transformed['bouwjaar'] = 2000
+    df_transformed['energielabel'] = 'C'
+    df_transformed['datum'] = pd.to_datetime(df_transformed['jaar'], format='%YJJ00')
+    
+    return df_transformed
 
 # Load data
 df = load_data()
@@ -160,18 +202,29 @@ elif page == "📊 Markt Analyse":
         st.plotly_chart(fig, use_container_width=True)
         
         # Statistieken tabel
+# Statistieken tabel
         stats_df = filtered_df.groupby(['stad', 'type_woning'])['prijs'].agg([
             'count', 'mean', 'median', 'std'
         ]).round(0)
+
+        # Hernoem kolommen naar Nederlandse namen
         stats_df.columns = ['Aantal', 'Gemiddeld', 'Mediaan', 'Std Dev']
-        st.dataframe(stats_df, use_container_width=True)
+
+        # Format de tabel met mooie styling
+        styled_stats = stats_df.style.format({
+            'Gemiddeld': '€{:,.0f}',
+            'Mediaan': '€{:,.0f}', 
+            'Std Dev': '€{:,.0f}'
+        })
+
+        st.dataframe(styled_stats, use_container_width=True)
     
     with tab2:
         st.subheader("Prijstrends over Tijd")
         
         # Maandelijkse gemiddelden
         monthly_avg = filtered_df.groupby([
-            pd.Grouper(key='datum', freq='M'), 
+            pd.Grouper(key='datum', freq='ME'), 
             'stad'
         ])['prijs'].mean().reset_index()
         
@@ -206,28 +259,35 @@ elif page == "📊 Markt Analyse":
     with tab3:
         st.subheader("Correlatie Analyse")
         
-        # Scatter plot matrix
+        # Scatter plot matrix - fix het length probleem
         numerical_cols = ['oppervlakte', 'kamers', 'bouwjaar', 'prijs']
+        
+        # Sample data en zorg dat alles dezelfde lengte heeft
+        sample_size = min(1000, len(filtered_df))
+        sampled_df = filtered_df[numerical_cols].sample(sample_size).copy()
+        
         fig = px.scatter_matrix(
-            filtered_df[numerical_cols].sample(min(1000, len(filtered_df))),
+            sampled_df,
             dimensions=numerical_cols,
-            color=filtered_df['prijs'],
             title='Feature Correlaties'
         )
         fig.update_traces(diagonal_visible=False)
         st.plotly_chart(fig, use_container_width=True)
         
         # Correlation heatmap
-        corr_matrix = filtered_df[numerical_cols].corr()
-        fig = px.imshow(
-            corr_matrix,
-            text_auto=True,
-            title='Correlatie Heatmap',
-            color_continuous_scale='RdBu',
-            aspect='auto'
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
+        if len(sampled_df) > 1:
+            corr_matrix = sampled_df.corr()
+            fig = px.imshow(
+                corr_matrix,
+                text_auto=True,
+                title='Correlatie Heatmap',
+                color_continuous_scale='RdBu',
+                aspect='auto'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Niet genoeg data voor correlatie analyse")
+        
     with tab4:
         st.subheader("Top Performing Segmenten")
         
@@ -238,29 +298,42 @@ elif page == "📊 Markt Analyse":
         
         segment_performance.columns = ['Gem_Prijs', 'Volatiliteit', 'Aantal']
         segment_performance['Sharpe_Ratio'] = (
-            segment_performance['Gem_Prijs'] / segment_performance['Volatiliteit']
+            segment_performance['Gem_Prijs'] / segment_performance['Volatiliteit'].replace(0, 1)
         ).round(2)
         
         # Top 10 segmenten
         top_segments = segment_performance.sort_values('Sharpe_Ratio', ascending=False).head(10)
         
-        st.dataframe(
-            top_segments.style.highlight_max(axis=0),
-            use_container_width=True
-        )
+        # Format de top segments tabel (HIER, binnen de tab!)
+        styled_top = top_segments.style.format({
+            'Gem_Prijs': '€{:,.0f}',
+            'Volatiliteit': '€{:,.0f}',
+            'Aantal': '{:,.0f}',
+            'Sharpe_Ratio': '{:.2f}'
+        }).highlight_max(axis=0)
         
-        # Visualisatie
-        fig = px.scatter(
-            segment_performance.reset_index(),
-            x='Volatiliteit',
-            y='Gem_Prijs',
-            size='Aantal',
-            color='Sharpe_Ratio',
-            hover_data=['stad', 'type_woning'],
-            title='Risk-Return Profile per Segment',
-            labels={'Gem_Prijs': 'Gemiddelde Prijs (€)', 'Volatiliteit': 'Risico (Std Dev)'}
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(styled_top, use_container_width=True)
+        
+        # Visualisatie - fix het length probleem
+        segment_reset = segment_performance.reset_index()
+        
+        # Alleen segmenten met genoeg data
+        segment_filtered = segment_reset[segment_reset['Aantal'] >= 3]
+        
+        if len(segment_filtered) > 0:
+            fig = px.scatter(
+                segment_filtered,
+                x='Volatiliteit',
+                y='Gem_Prijs',
+                size='Aantal',
+                color='Sharpe_Ratio',
+                hover_data=['stad', 'type_woning'],
+                title='Risk-Return Profile per Segment',
+                labels={'Gem_Prijs': 'Gemiddelde Prijs (€)', 'Volatiliteit': 'Risico (Std Dev)'}
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Niet genoeg data voor segment analyse")
 
 elif page == "🤖 Prijs Voorspelling":
     st.header("🤖 AI Prijs Voorspelling")
@@ -396,7 +469,7 @@ elif page == "💼 Portfolio Optimalisatie":
     
     # Groepeer per stad/type voor portfolio assets
     portfolio_assets = df.groupby(['stad', 'type_woning'])['prijs'].agg(['mean', 'count']).reset_index()
-    portfolio_assets = portfolio_assets[portfolio_assets['count'] >= 30]  # Alleen segmenten met voldoende data
+    portfolio_assets = portfolio_assets[portfolio_assets['count'] >= 2]  # Alleen segmenten met voldoende data
     portfolio_assets['asset_name'] = portfolio_assets['stad'] + ' - ' + portfolio_assets['type_woning']
     
     selected_assets = st.multiselect(
